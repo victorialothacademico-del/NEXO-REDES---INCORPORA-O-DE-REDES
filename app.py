@@ -1,179 +1,295 @@
-import json
-import os
-import tempfile
-import shutil
+import os, re, json, random, tempfile, shutil
 from datetime import datetime
-
+import pandas as pd
 import streamlit as st
+from supabase import create_client
+
+if "GEMINI_API_KEY" in st.secrets:
+    os.environ["GEMINI_API_KEY"] = st.secrets["GEMINI_API_KEY"]
 
 from pipeline import (
-    SolicitacaoIncorporacao,
-    validar_documentacao,
-    analisar_pasta_pdfs,
-    MODELO_DECISAO,
-    MODELO_EXTRACAO_PDF,
+    SolicitacaoIncorporacao, validar_documentacao,
+    analisar_pasta_pdfs, MODELO_DECISAO, MODELO_EXTRACAO_PDF,
 )
 
-st.set_page_config(page_title="NEXO REDES | Gestão de processos", page_icon="⚡", layout="wide")
+st.set_page_config(page_title="Validação Documental NT.017", layout="wide")
 
-st.markdown("""
-<style>
-:root { --navy:#102D40; --blue:#1C526E; --accent:#4386A2; }
-.block-container {padding-top: 2rem; max-width: 1180px;}
-[data-testid="stSidebar"] {background: #102D40;}
-[data-testid="stSidebar"] * {color: #F4F7F9 !important;}
-.nexo-brand {font-size: 2rem; font-weight: 800; letter-spacing: .04em; color:#102D40;}
-.nexo-sub {color:#607987; font-size:.78rem; letter-spacing:.12em;}
-.nexo-card {background:#F4F7F9; border:1px solid #E0E8ED; border-radius:14px; padding:18px;}
-</style>
-""", unsafe_allow_html=True)
-
-with st.sidebar:
-    st.markdown("# ⚡ NEXO REDES")
-    st.caption("GESTÃO INTELIGENTE DE REDES")
-    st.divider()
-    st.markdown("**Portal de solicitações**")
-    st.caption("Protótipo de desenvolvimento — acesso local, sem autenticação ainda.")
-    st.divider()
-    st.markdown("**Etapas**")
-    st.markdown("1. Identificação da obra\n2. Dados técnicos\n3. Documentação\n4. Análise inteligente")
-
-st.markdown('<div class="nexo-brand">NEXO REDES</div><div class="nexo-sub">PORTAL DE GESTÃO E ANÁLISE DE REDES DE DISTRIBUIÇÃO</div>', unsafe_allow_html=True)
-st.title("Nova solicitação")
-st.write("Cadastre as informações da obra e envie os documentos para uma análise documental assistida por inteligência artificial.")
-st.info("Esta versão é um protótipo para testes. Não envie documentos pessoais, bancários ou dados reais de clientes até concluirmos autenticação, controle de acesso e armazenamento seguro.")
+@st.cache_resource
+def db():
+    return create_client(st.secrets["SUPABASE_URL"], st.secrets["SUPABASE_KEY"])
 
 TIPOS = {
-    "Incorporação de redes": "incorporacao_rede",
-    "Doação de rede ou transformador novo": "doacao_rede_nova",
-    "Doação de rede ou transformador existente": "doacao_rede_existente",
+    "Incorporação (com ressarcimento)": "incorporacao_rede",
+    "Doação — Rede/Transformador NOVO": "doacao_rede_nova",
+    "Doação — Rede/Transformador EXISTENTE": "doacao_rede_existente",
 }
 
-with st.form("form_obra", clear_on_submit=False):
-    st.subheader("1. Identificação da solicitação")
+# Pergunta-chave: obra com TR até 300 kVA é ISENTA de Projeto Elétrico (normativa da distribuidora)
+TR_OPCOES = {
+    "Não sei (a IA tenta identificar)": None,
+    "Não (até 300 kVA)": False,
+    "Sim (acima de 300 kVA)": True,
+}
+
+# ---------------- ÁREA DO ADMINISTRADOR (barra lateral) ----------------
+with st.sidebar:
+    st.header("Administração")
+    senha = st.text_input("Senha", type="password")
+    admin = bool(senha) and senha == st.secrets.get("ADMIN_SENHA", None)
+
+if admin:
+    st.title("📋 Validação final do analista")
+
+    dados = db().table("submissoes").select("*").order("criado_em", desc=True).execute().data
+    if not dados:
+        st.info("Nenhuma obra enviada ainda.")
+        st.stop()
+
+    def _rotulo(d):
+        situacao = "✅ DEFINITIVO" if d.get("validado_em") else "⏳ aguardando validação"
+        return f"{d['protocolo']} | {d['responsavel_email']} | IA: {d['status']} | {situacao}"
+
+    idx = st.selectbox("Selecione a obra", list(range(len(dados))),
+                       format_func=lambda i: _rotulo(dados[i]))
+    escolhida = dados[idx]
+    r = escolhida.get("resultado") or {}
+
+    # ---- resultado proposto pela IA ----
+    st.subheader("Proposta da IA")
+    st.warning(f"{escolhida['status']}  |  Conformidade: {escolhida.get('score')}/100  "
+               f"(resultado PRELIMINAR até a validação do analista)")
     c1, c2 = st.columns(2)
     with c1:
-        tipo_label = st.selectbox("Modalidade *", list(TIPOS))
-        nome_obra = st.text_input("Nome da obra / empreendimento *")
-        empresa = st.text_input("Empresa / responsável pela obra *")
-        nome_responsavel = st.text_input("Nome do responsável técnico")
-        cpf_cnpj = st.text_input("CPF/CNPJ do responsável")
+        st.markdown("**Documentos reconhecidos**")
+        for x in r.get("documentos_reconhecidos", []):
+            st.write("✓", x)
+        st.markdown("**Documentos faltantes**")
+        for x in r.get("documentos_faltantes", []):
+            st.write("✗", x)
     with c2:
-        protocolo = st.text_input("Protocolo (se já existir)", value=f"PRE-{datetime.now():%Y%m%d-%H%M%S}")
-        endereco = st.text_input("Endereço da obra *")
-        municipio = st.text_input("Município / UF *")
-        email = st.text_input("E-mail para contato *")
-        telefone = st.text_input("Telefone")
+        st.markdown("**Pendências e alertas**")
+        for x in list(r.get("pendencias_condicionais", [])) + list(r.get("alertas_ativos", [])):
+            st.write("⚠️", x)
+        st.markdown("**Recomendações**")
+        for x in r.get("recomendacoes", []):
+            st.write("→", x)
+    st.markdown(f"**Justificativa da IA:** {r.get('justificativa_tecnica', '—')}")
 
-    st.divider()
-    st.subheader("2. Características técnicas")
-    c1, c2, c3 = st.columns(3)
-    with c1:
-        quantidade_tr = st.number_input("Quantidade de transformadores", min_value=0, step=1, value=0)
-    with c2:
-        potencia_total = st.number_input("Potência total dos transformadores (kVA)", min_value=0.0, step=15.0, value=0.0)
-    with c3:
-        tr_acima_300_label = st.selectbox("Há transformador acima de 300 kVA?", ["Não sei / confirmar", "Não — até 300 kVA", "Sim — acima de 300 kVA"])
-    descricao = st.text_area("Descrição da obra e informações complementares", height=100)
-    loteamento = st.radio("A obra corresponde exclusivamente a loteamento de lotes de terreno?", ["Não", "Sim"], horizontal=True)
-    st.caption("Se selecionar Sim, a declaração de iluminação pública será incluída como exigência documental.")
-
-    st.divider()
-    st.subheader("3. Condições específicas")
-    tipo = TIPOS[tipo_label]
-    restituicao = st.checkbox("Há restituição de valores ao cliente?", disabled=(tipo != "incorporacao_rede"))
-    condicoes_isencao = st.checkbox("Confirmo que não é acesso à geração distribuída, migração para mercado livre ou situação omissa à norma técnica.")
-
-    st.divider()
-    st.subheader("4. Documentos da obra")
-    st.markdown("**Atenção: envie toda a documentação reunida em um único arquivo PDF.**")
-    st.markdown("Organize o PDF obrigatoriamente nesta ordem inicial:")
-    st.markdown("1. **Orçamento de Conexão**")
-    st.markdown("2. **Projeto Elétrico**")
-    st.markdown("3. **Demais documentos exigidos**, conforme a modalidade do processo (ART/TRT, notas fiscais, documentos pessoais, laudos, autorizações e outros aplicáveis).")
-    st.info("Antes de enviar, confira se todos os documentos estão no mesmo PDF e se o Orçamento de Conexão e o Projeto Elétrico aparecem nas duas primeiras posições.")
-    arquivo_pdf = st.file_uploader("Anexe o arquivo único com toda a documentação (somente PDF)", type=["pdf"], accept_multiple_files=False)
-    enviar = st.form_submit_button("Iniciar análise documental", type="primary", use_container_width=True)
-
-if enviar:
-    obrigatorios = [nome_obra, empresa, endereco, municipio, email]
-    if any(not str(x).strip() for x in obrigatorios):
-        st.error("Preencha os campos obrigatórios de identificação da obra.")
-    elif not arquivo_pdf:
-        st.error("Anexe um único arquivo PDF contendo toda a documentação da obra.")
-    elif not os.getenv("GEMINI_API_KEY") and "GEMINI_API_KEY" not in st.secrets:
-        st.error("Configure GEMINI_API_KEY antes de executar a análise.")
+    # ---- validação humana (etapa final obrigatória) ----
+    st.subheader("Decisão do analista")
+    if escolhida.get("validado_em"):
+        st.success(f"✅ DEFINITIVO: {escolhida.get('decisao_final')}  "
+                   f"(ação: {escolhida.get('acao_analista')}, analista: {escolhida.get('analista')}, "
+                   f"em {str(escolhida['validado_em'])[:16].replace('T', ' ')})")
+        if escolhida.get("divergiu_da_ia"):
+            st.info("O analista divergiu da proposta da IA.")
+        if escolhida.get("observacao"):
+            st.write("Observação:", escolhida["observacao"])
     else:
-        if "GEMINI_API_KEY" in st.secrets:
-            os.environ["GEMINI_API_KEY"] = st.secrets["GEMINI_API_KEY"]
-        pasta = tempfile.mkdtemp(prefix="nexo_")
-        try:
-            safe_name = os.path.basename(arquivo_pdf.name).replace("..", "_")
-            with open(os.path.join(pasta, safe_name), "wb") as dest:
-                dest.write(arquivo_pdf.getbuffer())
-            with st.spinner("Lendo os documentos e extraindo informações com Gemini..."):
-                ext = analisar_pasta_pdfs(pasta, tipo, modelo=MODELO_EXTRACAO_PDF)
-            info = ext.get("info_geral", {})
-            tr_acima_300 = {"Não sei / confirmar": None, "Não — até 300 kVA": False, "Sim — acima de 300 kVA": True}[tr_acima_300_label]
-            pot = potencia_total if potencia_total > 0 else ext.get("potencia_transformador_kva")
-            observacoes = (
-                f"Nome da obra: {nome_obra}. Empresa: {empresa}. Município/UF: {municipio}. "
-                f"E-mail: {email}. Telefone: {telefone}. Quantidade de transformadores: {quantidade_tr}. "
-                f"Potência total informada (kVA): {potencia_total}. Descrição: {descricao}"
-            )
-            sol = SolicitacaoIncorporacao(
-                numero_protocolo=protocolo,
-                tipo_solicitacao=tipo,
-                nome_responsavel=nome_responsavel or info.get("nome_responsavel") or empresa,
-                cpf_cnpj=cpf_cnpj or info.get("cpf_cnpj") or "Não informado",
-                endereco_obra=f"{endereco}, {municipio}",
-                descricao_obra=descricao or info.get("descricao_obra") or nome_obra,
-                documentos_apresentados=ext.get("documentos_apresentados", []),
-                data_aprovacao_projeto=ext.get("data_aprovacao_projeto"),
-                data_aprovacao_orcamento=ext.get("data_aprovacao_orcamento"),
-                possui_restituicao_valores=(restituicao and tipo == "incorporacao_rede"),
-                potencia_transformador_kva=pot,
-                tr_acima_300kva=tr_acima_300,
-                condicoes_isencao_confirmadas=(True if condicoes_isencao else None),
-                is_loteamento_lotes_terreno=(loteamento == "Sim"),
-                observacoes_adicionais=observacoes,
-            )
-            with st.spinner("Aplicando checklist e regras de validação..."):
-                res = validar_documentacao(sol, modelo=MODELO_DECISAO)
-            st.session_state["nexo_resultado"] = res
-            st.session_state["nexo_extracao"] = ext
-            st.session_state["nexo_dados"] = {"obra":nome_obra,"empresa":empresa,"tipo":tipo_label,"loteamento":loteamento}
-        except Exception as e:
-            st.exception(e)
-        finally:
-            shutil.rmtree(pasta, ignore_errors=True)
+        with st.form(f"validacao_{idx}"):
+            analista = st.text_input("Nome do analista *")
+            acao = st.radio("Decisão", ["Concordo com a IA", "Altero para…", "Rejeito (reprovo)"])
+            novo = st.selectbox("Se for alterar, status final:",
+                                ["APROVADO", "APROVADO_COM_RESSALVAS", "REPROVADO"])
+            obs = st.text_area("Observação (obrigatória se alterar ou rejeitar)")
+            salvar = st.form_submit_button("Registrar decisão final", type="primary")
 
-res = st.session_state.get("nexo_resultado")
+        if salvar:
+            if not analista.strip():
+                st.error("Informe o nome do analista.")
+            elif acao != "Concordo com a IA" and not obs.strip():
+                st.error("Explique o motivo na observação.")
+            else:
+                if acao == "Concordo com a IA":
+                    final, tag = escolhida["status"], "CONCORDO"
+                elif acao == "Altero para…":
+                    final, tag = novo, "ALTERO"
+                else:
+                    final, tag = "REPROVADO", "REJEITO"
+
+                try:
+                    q = db().table("submissoes").update({
+                        "decisao_ia": escolhida["status"],
+                        "decisao_final": final,
+                        "acao_analista": tag,
+                        "analista": analista.strip(),
+                        "observacao": obs.strip(),
+                        "divergiu_da_ia": final != escolhida["status"],
+                        "validado_em": datetime.now().astimezone().isoformat(),
+                    })
+                    if escolhida.get("id") is not None:
+                        q = q.eq("id", escolhida["id"])
+                    else:
+                        q = q.eq("protocolo", escolhida["protocolo"]) \
+                             .eq("responsavel_email", escolhida["responsavel_email"])
+                    q.execute()
+                    st.success("Decisão registrada.")
+                    st.rerun()
+                except Exception as e:
+                    if "rerun" in type(e).__name__.lower():
+                        raise
+                    st.error(f"Não foi possível salvar a decisão (as colunas novas foram criadas "
+                             f"no Supabase?): {e}")
+
+    # ---- visão geral ----
+    st.subheader("Todas as obras")
+    cols = ["criado_em", "protocolo", "responsavel_email", "tipo", "status",
+            "decisao_final", "analista", "divergiu_da_ia", "validado_em"]
+    st.dataframe(pd.DataFrame(dados).reindex(columns=cols), use_container_width=True)
+
+    st.subheader("Responsáveis cadastrados")
+    rts = db().table("responsaveis").select("*").order("criado_em", desc=True).execute().data
+    st.dataframe(pd.DataFrame(rts), use_container_width=True)
+    st.stop()
+
+# ---------------- TELA 1: CADASTRO ----------------
+st.title("🔌 Validação Documental — Incorporação/Doação de Rede")
+st.caption("CEEE-D / Equatorial Energia | NT.017.EQTL – Revisão 04")
+
+if "rt" not in st.session_state:
+    st.subheader("1. Cadastro do responsável técnico")
+    with st.form("cadastro"):
+        nome = st.text_input("Nome completo *")
+        crea = st.text_input("CREA / CFT")
+        email = st.text_input("E-mail *")
+        telefone = st.text_input("Telefone")
+        empresa = st.text_input("Empresa")
+        ok = st.form_submit_button("Cadastrar e continuar")
+    if ok:
+        if not nome.strip() or "@" not in email:
+            st.error("Preencha o nome e um e-mail válido.")
+        else:
+            rt = {"nome": nome.strip(), "crea": crea.strip(), "email": email.strip().lower(),
+                  "telefone": telefone.strip(), "empresa": empresa.strip()}
+            db().table("responsaveis").upsert(rt, on_conflict="email").execute()
+            st.session_state["rt"] = rt
+            st.rerun()
+    st.stop()
+
+rt = st.session_state["rt"]
+st.success(f"Olá, {rt['nome']}!")
+
+# ---------------- TELA 2: ENVIO ----------------
+st.subheader("2. Envio da documentação da obra")
+col1, col2 = st.columns(2)
+with col1:
+    tipo = TIPOS[st.radio("Tipo de obra", list(TIPOS))]
+    protocolo = st.text_input(
+        "Protocolo", f"{datetime.now().year}-{random.randint(100000, 999999)}"
+    )
+with col2:
+    tr_acima_300 = TR_OPCOES[st.radio(
+        "A obra possui transformador (TR) maior que 300 kVA?",
+        list(TR_OPCOES),
+        horizontal=True,
+        help="Obras com TR de até 300 kVA são isentas de Projeto Elétrico. "
+             "Se marcar 'Não', o projeto não será cobrado. Se marcar 'Sim', será exigido normalmente.",
+    )]
+    restituicao = st.checkbox(
+        "Há restituição de valores ao cliente? (só em incorporação)",
+        disabled=(tipo != "incorporacao_rede"),
+    )
+    isencao = st.checkbox(
+        "Confirmo que este pedido NÃO é acesso a geração distribuída, "
+        "NÃO é migração para mercado livre e NÃO tem situação omissa à "
+        "Norma Técnica (só relevante se a subestação for ≤300kVA)",
+        disabled=(tr_acima_300 is True),
+    )
+
+arquivos = st.file_uploader("Anexe os PDFs da obra", type="pdf", accept_multiple_files=True)
+
+if st.button("▶ Processar documentação", type="primary", disabled=not arquivos):
+    pasta = tempfile.mkdtemp()
+    try:
+        for f in arquivos:
+            with open(os.path.join(pasta, f.name), "wb") as out:
+                out.write(f.getbuffer())
+
+        with st.spinner("Lendo os PDFs (pode levar alguns minutos)..."):
+            ext = analisar_pasta_pdfs(pasta, tipo, modelo=MODELO_EXTRACAO_PDF)
+
+        info = ext["info_geral"]
+        sol = SolicitacaoIncorporacao(
+            numero_protocolo=protocolo,
+            tipo_solicitacao=tipo,
+            nome_responsavel=info["nome_responsavel"] or "Nome do Responsável (não encontrado nos PDFs)",
+            cpf_cnpj=info["cpf_cnpj"] or "000.000.000-00 (não encontrado nos PDFs)",
+            endereco_obra=info["endereco_obra"] or "Endereço não encontrado nos PDFs",
+            descricao_obra=info["descricao_obra"] or "Descrição não encontrada nos PDFs",
+            data_aprovacao_projeto=ext["data_aprovacao_projeto"],
+            data_aprovacao_orcamento=ext["data_aprovacao_orcamento"],
+            possui_restituicao_valores=(restituicao and tipo == "incorporacao_rede"),
+            documentos_apresentados=ext["documentos_apresentados"],
+            potencia_transformador_kva=ext.get("potencia_transformador_kva"),
+            tr_acima_300kva=tr_acima_300,
+            condicoes_isencao_confirmadas=(True if (isencao and tr_acima_300 is not True) else None),
+        )
+
+        with st.spinner("Validando conforme a NT.017..."):
+            res = validar_documentacao(sol, modelo=MODELO_DECISAO)
+
+        # guarda PDFs e resultado no Supabase
+        seguro = re.sub(r"[^a-zA-Z0-9_.-]", "_", rt["email"])
+        proto_seg = re.sub(r"[^a-zA-Z0-9_.-]", "_", protocolo)
+        caminhos = []
+        for f in arquivos:
+            nome_seg = re.sub(r"[^a-zA-Z0-9_.-]", "_", f.name)
+            caminho = f"{seguro}/{proto_seg}/{nome_seg}"
+            db().storage.from_("pdfs").upload(
+                caminho, f.getvalue(),
+                {"content-type": "application/pdf", "upsert": "true"},
+            )
+            caminhos.append(caminho)
+
+        db().table("submissoes").insert({
+            "responsavel_email": rt["email"], "protocolo": protocolo, "tipo": tipo,
+            "status": res.status, "score": res.score_conformidade,
+            "resultado": json.loads(json.dumps(res.para_dict(), default=str)),
+            "arquivos": caminhos,
+        }).execute()
+
+        st.session_state["resultado"] = res
+        st.session_state["extracao"] = ext
+    except Exception as e:
+        st.error(f"Erro no processamento: {e}")
+    finally:
+        shutil.rmtree(pasta, ignore_errors=True)
+
+# ---------------- TELA 3: RESULTADO ----------------
+res = st.session_state.get("resultado")
 if res:
-    ext = st.session_state.get("nexo_extracao", {})
-    dados = st.session_state.get("nexo_dados", {})
-    st.divider()
-    st.header("Resultado da análise")
-    st.caption(f"{dados.get('obra','')} · {dados.get('tipo','')} · Protocolo {res.numero_protocolo}")
-    if res.status == "APROVADO": st.success(f"APROVADO · Conformidade {res.score_conformidade}/100")
-    elif res.status == "REPROVADO": st.error(f"REPROVADO · Conformidade {res.score_conformidade}/100")
-    else: st.warning(f"APROVADO COM RESSALVAS · Conformidade {res.score_conformidade}/100")
-    if getattr(res, "isento_projeto_por_potencia", False):
-        st.info("A regra de isenção de projeto por potência foi aplicada; confirme as condições normativas com o analista.")
-    c1,c2 = st.columns(2)
+    ext = st.session_state["extracao"]
+    mostrar = {"APROVADO": st.success, "REPROVADO": st.error,
+               "APROVADO_COM_RESSALVAS": st.warning}.get(res.status, st.info)
+    mostrar(f"{res.status}  |  Conformidade: {res.score_conformidade}/100  —  PRELIMINAR (sujeito à validação final do analista)")
+    if res.isento_projeto_por_potencia:
+        st.info("🔋 Obra isenta de Projeto Elétrico (TR até 300 kVA). O projeto não é exigido nesta análise.")
+
+    for aviso in ext.get("avisos_datas", []):
+        st.warning(aviso)
+
+    c1, c2 = st.columns(2)
     with c1:
         st.subheader("Documentos reconhecidos")
-        for d in res.documentos_reconhecidos: st.write("✓",d)
+        for d in res.documentos_reconhecidos:
+            st.write("✓", d)
         st.subheader("Documentos faltantes")
-        for d in res.documentos_faltantes: st.write("•",d)
+        for d in res.documentos_faltantes:
+            st.write("✗", d)
     with c2:
         st.subheader("Pendências e alertas")
-        for d in list(res.pendencias_condicionais)+list(res.alertas_ativos): st.write("⚠️",d)
+        for p in list(res.pendencias_condicionais) + list(res.alertas_ativos):
+            st.write("⚠️", p)
         st.subheader("Recomendações")
-        for d in res.recomendacoes: st.write("→",d)
-    st.info(f"Próximo passo: {res.proximo_passo}")
-    st.write("**Justificativa técnica**")
-    st.write(res.justificativa_tecnica)
-    with st.expander("Auditoria da extração dos PDFs"):
-        st.json(ext.get("analises_detalhadas", []))
-    st.download_button("Baixar relatório JSON", json.dumps(res.para_dict(),ensure_ascii=False,indent=2,default=str), file_name=f"nexo_{res.numero_protocolo}.json", mime="application/json")
+        for r in res.recomendacoes:
+            st.write("→", r)
+
+    st.info(f"**Próximo passo:** {res.proximo_passo}")
+    st.markdown(f"**Justificativa técnica:** {res.justificativa_tecnica}")
+
+    st.download_button(
+        "Baixar resultado (JSON)",
+        json.dumps(res.para_dict(), ensure_ascii=False, indent=2, default=str),
+        file_name=f"resultado_{res.numero_protocolo}.json",
+        mime="application/json",
+    )
