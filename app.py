@@ -1,4 +1,4 @@
-import os, re, json, random, tempfile, shutil
+import os, re, json, random, tempfile, shutil, secrets
 from datetime import datetime
 import pandas as pd
 import streamlit as st
@@ -30,6 +30,73 @@ TR_OPCOES = {
     "Não (até 300 kVA)": False,
     "Sim (acima de 300 kVA)": True,
 }
+
+# ---------------- ACOMPANHAMENTO PELO RT ----------------
+_ALFABETO_CODIGO = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"   # sem 0/O/1/I para evitar confusão
+
+def gerar_codigo():
+    return "".join(secrets.choice(_ALFABETO_CODIGO) for _ in range(8))
+
+def fmt_codigo(c):
+    c = str(c or "")
+    return f"{c[:4]}-{c[4:]}" if len(c) == 8 else c
+
+def norm_codigo(c):
+    return re.sub(r"[^A-Za-z0-9]", "", str(c or "")).upper()
+
+ROTULO_STATUS = {
+    "APROVADO": "APROVADO",
+    "APROVADO_COM_RESSALVAS": "APROVADO COM RESSALVAS",
+    "REPROVADO": "REPROVADO",
+}
+
+def mostrar_consulta(sub):
+    """Mostra ao RT o andamento de UMA obra. Só exibe o resultado como DEFINITIVO depois
+    que o analista validou; antes disso, informa que ainda está em análise."""
+    r = sub.get("resultado") or {}
+    st.markdown(f"### Protocolo {sub.get('protocolo')}")
+    enviado = str(sub.get("criado_em") or "")[:16].replace("T", " ")
+    st.caption(f"Enviado em {enviado}")
+
+    if not sub.get("validado_em"):
+        st.info("⏳ **Em análise.** Sua documentação foi recebida e processada, "
+                "mas ainda aguarda a validação final do analista. "
+                "Volte a consultar mais tarde com o mesmo código.")
+        with st.expander("Ver análise preliminar (automática, sujeita a alteração)"):
+            st.write(f"Situação preliminar: **{ROTULO_STATUS.get(sub.get('status'), sub.get('status'))}** "
+                     f"— conformidade {sub.get('score')}/100")
+            for x in r.get("documentos_faltantes", []):
+                st.write("✗", x)
+            for x in list(r.get("pendencias_condicionais", [])) + list(r.get("alertas_ativos", [])):
+                st.write("⚠️", x)
+        return
+
+    final = sub.get("decisao_final")
+    texto = ROTULO_STATUS.get(final, final)
+    {"APROVADO": st.success, "REPROVADO": st.error}.get(final, st.warning)(
+        f"✅ Análise concluída — **{texto}**  "
+        f"(validado em {str(sub['validado_em'])[:10]})"
+    )
+    if sub.get("observacao"):
+        st.markdown("**Observação do analista**")
+        st.write(sub["observacao"])
+
+    # Pontos de atenção só aparecem se o resultado final não for aprovação plena
+    if final != "APROVADO":
+        faltantes = r.get("documentos_faltantes", [])
+        pend = list(r.get("pendencias_condicionais", [])) + list(r.get("alertas_ativos", []))
+        recs = r.get("recomendacoes", [])
+        if faltantes or pend or recs:
+            st.markdown("**Pontos de atenção da análise**")
+            for x in faltantes:
+                st.write("✗", x)
+            for x in pend:
+                st.write("⚠️", x)
+            for x in recs:
+                st.write("→", x)
+    if r.get("proximo_passo") and final != "APROVADO":
+        st.info(f"**Próximo passo sugerido:** {r['proximo_passo']}")
+
 
 # ---------------- ÁREA DO ADMINISTRADOR (barra lateral) ----------------
 with st.sidebar:
@@ -133,7 +200,7 @@ if admin:
 
     # ---- visão geral ----
     st.subheader("Todas as obras")
-    cols = ["criado_em", "protocolo", "responsavel_email", "tipo", "status",
+    cols = ["criado_em", "protocolo", "codigo_consulta", "responsavel_email", "tipo", "status",
             "decisao_final", "analista", "divergiu_da_ia", "validado_em"]
     st.dataframe(pd.DataFrame(dados).reindex(columns=cols), use_container_width=True)
 
@@ -142,9 +209,43 @@ if admin:
     st.dataframe(pd.DataFrame(rts), use_container_width=True)
     st.stop()
 
-# ---------------- TELA 1: CADASTRO ----------------
+# ---------------- NAVEGAÇÃO ----------------
 st.title("🔌 Validação Documental — Incorporação/Doação de Rede")
 st.caption("CEEE-D / Equatorial Energia | NT.017.EQTL – Revisão 04")
+
+pagina = st.radio("Menu", ["Enviar nova obra", "Consultar andamento"],
+                  horizontal=True, label_visibility="collapsed")
+
+# ---------------- CONSULTA DE ANDAMENTO (RT) ----------------
+if pagina == "Consultar andamento":
+    st.subheader("Consultar andamento da obra")
+    st.write("Informe o e-mail do cadastro e o **código de acompanhamento** que apareceu "
+             "quando você enviou a documentação.")
+    with st.form("consulta"):
+        c_email = st.text_input("E-mail do cadastro")
+        c_codigo = st.text_input("Código de acompanhamento (ex.: ABCD-EFGH)")
+        buscar = st.form_submit_button("Consultar", type="primary")
+    if buscar:
+        codigo = norm_codigo(c_codigo)
+        if "@" not in c_email or len(codigo) != 8:
+            st.error("Informe um e-mail válido e o código de 8 caracteres.")
+        else:
+            try:
+                achou = (db().table("submissoes").select("*")
+                         .eq("responsavel_email", c_email.strip().lower())
+                         .eq("codigo_consulta", codigo)
+                         .order("criado_em", desc=True).limit(1).execute().data)
+            except Exception as e:
+                achou = None
+                st.error(f"Não foi possível consultar agora: {e}")
+            if achou is not None:
+                if not achou:
+                    st.error("Nenhuma obra encontrada com esse e-mail e código. Confira os dados.")
+                else:
+                    mostrar_consulta(achou[0])
+    st.stop()
+
+# ---------------- TELA 1: CADASTRO ----------------
 
 if "rt" not in st.session_state:
     st.subheader("1. Cadastro do responsável técnico")
@@ -241,15 +342,25 @@ if st.button("▶ Processar documentação", type="primary", disabled=not arquiv
             )
             caminhos.append(caminho)
 
-        db().table("submissoes").insert({
+        registro = {
             "responsavel_email": rt["email"], "protocolo": protocolo, "tipo": tipo,
             "status": res.status, "score": res.score_conformidade,
             "resultado": json.loads(json.dumps(res.para_dict(), default=str)),
             "arquivos": caminhos,
-        }).execute()
+        }
+        codigo = gerar_codigo()
+        try:
+            db().table("submissoes").insert({**registro, "codigo_consulta": codigo}).execute()
+        except Exception as e:
+            if "codigo_consulta" not in str(e):
+                raise
+            # coluna ainda não criada no Supabase: salva sem código para não perder a obra
+            db().table("submissoes").insert(registro).execute()
+            codigo = None
 
         st.session_state["resultado"] = res
         st.session_state["extracao"] = ext
+        st.session_state["codigo_consulta"] = codigo
     except Exception as e:
         st.error(f"Erro no processamento: {e}")
     finally:
@@ -259,6 +370,11 @@ if st.button("▶ Processar documentação", type="primary", disabled=not arquiv
 res = st.session_state.get("resultado")
 if res:
     ext = st.session_state["extracao"]
+    cod = st.session_state.get("codigo_consulta")
+    if cod:
+        st.success(f"📌 **Código de acompanhamento: {fmt_codigo(cod)}** — guarde este código. "
+                   f"Use-o com o seu e-mail na opção *Consultar andamento* para ver "
+                   f"a decisão final do analista.")
     mostrar = {"APROVADO": st.success, "REPROVADO": st.error,
                "APROVADO_COM_RESSALVAS": st.warning}.get(res.status, st.info)
     mostrar(f"{res.status}  |  Conformidade: {res.score_conformidade}/100  —  PRELIMINAR (sujeito à validação final do analista)")
