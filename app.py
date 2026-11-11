@@ -268,6 +268,14 @@ if res:
     for aviso in ext.get("avisos_datas", []):
         st.warning(aviso)
 
+    # Arquivos que deram erro na leitura (ex.: cota do Gemini) — antes só apareciam no log
+    for an in ext.get("analises_detalhadas", []):
+        for item in an.get("resultado", []):
+            doc = str(item.get("documento_identificado", ""))
+            if doc.startswith("ERRO NA ANÁLISE"):
+                st.error(f"⚠️ O arquivo '{an['arquivo']}' não pôde ser lido: {doc[len('ERRO NA ANÁLISE: '):][:300]}. "
+                         f"Os documentos dele podem aparecer como ausentes — reprocesse ou confira o arquivo.")
+
     c1, c2 = st.columns(2)
     with c1:
         st.subheader("Documentos reconhecidos")

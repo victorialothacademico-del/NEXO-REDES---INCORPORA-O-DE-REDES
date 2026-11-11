@@ -1349,6 +1349,23 @@ def analisar_pdf_individual(cliente, modelo, arquivo_pdf_path, tipo_solicitacao,
     return todos_resultados
 
 
+_analisar_pdf_individual_original = analisar_pdf_individual
+
+
+def analisar_pdf_individual(cliente, modelo, arquivo_pdf_path, tipo_solicitacao, max_tentativas=5):
+    """Lê o 'Assunto' no texto do PDF ANTES do Gemini. Se o Gemini falhar (cota, erro de API,
+    timeout), mantém o que a leitura de texto já identificou em vez de perder o arquivo inteiro."""
+    docs_texto, _ = _detectar_documentos_por_texto(arquivo_pdf_path)
+    try:
+        return _analisar_pdf_individual_original(
+            cliente, modelo, arquivo_pdf_path, tipo_solicitacao, max_tentativas)
+    except Exception as e:
+        if not docs_texto:
+            raise
+        print(f"     ⚠️ Gemini falhou ({str(e)[:120]}). Usando só a leitura do Assunto no texto do PDF.")
+        return _mesclar_com_deteccao_por_texto([], docs_texto, tipo_solicitacao)
+
+
 def _normalizar_lista_documentos(dados_json):
     """Aceita tanto o formato novo ({'documentos_identificados': [...]}) quanto,
     por segurança, o formato antigo de objeto único (caso algum modelo/versão
