@@ -808,7 +808,7 @@ def validar_documentacao(solicitacao, modelo=MODELO_DECISAO):
     if not chave:
         raise EnvironmentError("API Key não encontrada. Configure nos Secrets do Colab (Célula 2).")
 
-    cliente = genai.Client(api_key=chave)
+    cliente = genai.Client(api_key=chave, http_options=genai.types.HttpOptions(api_version="v1beta"))
 
     texto_resposta = _chamar_gemini(
         cliente=cliente,
@@ -1355,13 +1355,18 @@ _analisar_pdf_individual_original = analisar_pdf_individual
 def analisar_pdf_individual(cliente, modelo, arquivo_pdf_path, tipo_solicitacao, max_tentativas=5):
     """Lê o 'Assunto' no texto do PDF ANTES do Gemini. Se o Gemini falhar (cota, erro de API,
     timeout), mantém o que a leitura de texto já identificou em vez de perder o arquivo inteiro."""
-    docs_texto, _ = _detectar_documentos_por_texto(arquivo_pdf_path)
+    docs_texto, texto_confiavel = _detectar_documentos_por_texto(arquivo_pdf_path)
     try:
         return _analisar_pdf_individual_original(
             cliente, modelo, arquivo_pdf_path, tipo_solicitacao, max_tentativas)
     except Exception as e:
         if not docs_texto:
-            raise
+            motivo_texto = (
+                "o PDF tem texto, mas nenhuma página traz 'Assunto: Orçamento de Conexão' ou "
+                "'Assunto: Aprovação de Projeto'" if texto_confiavel
+                else "o PDF parece escaneado (sem texto selecionável), então a leitura por texto não funcionou"
+            )
+            raise RuntimeError(f"{e} | Leitura por texto: {motivo_texto}.") from e
         print(f"     ⚠️ Gemini falhou ({str(e)[:120]}). Usando só a leitura do Assunto no texto do PDF.")
         return _mesclar_com_deteccao_por_texto([], docs_texto, tipo_solicitacao)
 
@@ -1438,7 +1443,7 @@ def analisar_pasta_pdfs(caminho_pasta, tipo_solicitacao, modelo=None):
     if not chave:
         raise EnvironmentError("API Key não encontrada. Configure nos Secrets do Colab.")
 
-    cliente = genai.Client(api_key=chave)
+    cliente = genai.Client(api_key=chave, http_options=genai.types.HttpOptions(api_version="v1beta"))
 
     pasta = pathlib.Path(caminho_pasta)
     arquivos_pdf = sorted([p for p in pasta.glob("*.pdf")])
